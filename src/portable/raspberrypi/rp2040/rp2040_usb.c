@@ -31,6 +31,7 @@
 
 #include <stdlib.h>
 #include "rp2040_usb.h"
+#include "pico/time.h"
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTOTYPE
@@ -91,6 +92,7 @@ void __tusb_irq_path_func(hw_endpoint_reset_transfer)(struct hw_endpoint* ep) {
   ep->remaining_len = 0;
   ep->xferred_len = 0;
   ep->user_buf = 0;
+  ep->last_out_transfer = 0;
 }
 
 void __tusb_irq_path_func(_hw_endpoint_buffer_control_update32)(struct hw_endpoint* ep, uint32_t and_mask,
@@ -321,6 +323,11 @@ bool __tusb_irq_path_func(hw_endpoint_xfer_continue)(struct hw_endpoint* ep) {
     if (e15_is_critical_frame_period(ep)) {
       ep->pending = 1;
     } else {
+      if ((ep->rx) && (ep->transfer_type == TUSB_XFER_BULK))
+      {
+        ep->last_out_transfer = time_us_32();
+      }
+
       hw_endpoint_start_next_buffer(ep);
     }
   }

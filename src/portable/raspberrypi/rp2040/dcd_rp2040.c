@@ -31,6 +31,7 @@
 #include "pico.h"
 #include "hardware/sync.h"
 #include "rp2040_usb.h"
+#include "pico/time.h"
 
 #if TUD_OPT_RP2040_USB_DEVICE_ENUMERATION_FIX
 #include "pico/fix/rp2040_usb_device_enumeration.h"
@@ -63,6 +64,68 @@ TU_ATTR_ALWAYS_INLINE static inline struct hw_endpoint* hw_endpoint_get_by_addr(
   uint8_t num = tu_edpt_number(ep_addr);
   tusb_dir_t dir = tu_edpt_dir(ep_addr);
   return hw_endpoint_get_by_num(num, dir);
+}
+
+static repeating_timer_t rp2040_out_auto_zlp_timer;
+
+bool rp2040_out_auto_zlp_timer_callback(__unused repeating_timer_t *rt)
+{
+    const uint32_t current_time = time_us_32();
+    for (uint8_t i = 0; i < USB_MAX_ENDPOINTS; i++)
+    {
+        struct hw_endpoint *ep = hw_endpoint_get_by_num(i, TUSB_DIR_OUT);
+
+        hw_endpoint_lock_update(ep, 1);
+
+        if (ep->last_out_transfer)
+        {
+            uint32_t time_from_last_out_transfer = 0;
+
+            if ((ep->last_out_transfer & UINT32_C(0x80000000)) && !(current_time & UINT32_C(0x80000000)))
+            {
+                time_from_last_out_transfer = UINT32_MAX - ep->last_out_transfer + current_time + 1;
+            }
+            else if (ep->last_out_transfer < current_time)
+            {
+                time_from_last_out_transfer = current_time - ep->last_out_transfer;
+            }
+            else
+            {
+                time_from_last_out_transfer = 0;
+            }
+
+            if (time_from_last_out_transfer > 4000)
+            {
+                ep->last_out_transfer = 0;
+
+                if (ep->active) {
+                    // Abort any pending transfer from a prior control transfer per USB specs
+                    // Due to Errata RP2040-E2: ABORT flag is only applicable for B2 and later (unusable for B0, B1).
+                    // Which means we are not guaranteed to safely abort pending transfer on B0 and B1.
+                    uint32_t abort_mask = (ep->rx ? USB_EP_ABORT_EP0_OUT_BITS : USB_EP_ABORT_EP0_IN_BITS );
+                    abort_mask <<= (tu_edpt_number(ep->ep_addr) * 2);
+                    if (rp2040_chip_version() >= 2) {
+                        usb_hw_set->abort = abort_mask;
+                        while ((usb_hw->abort_done & abort_mask) != abort_mask) {}
+                    }
+
+                    _hw_endpoint_buffer_control_set_value32(ep, (ep->next_pid ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID) | USB_BUF_CTRL_SEL);
+                    ep->next_pid ^= 1u;
+
+                    if (rp2040_chip_version() >= 2) {
+                        usb_hw_clear->abort_done = abort_mask;
+                        usb_hw_clear->abort = abort_mask;
+                    }
+                }
+
+                dcd_event_xfer_complete(0, ep->ep_addr, ep->xferred_len, XFER_RESULT_SUCCESS, true);
+                hw_endpoint_reset_transfer(ep);
+            }
+        }
+        hw_endpoint_lock_update(ep, -1);
+    }
+
+    return true;
 }
 
 // Allocate from the USB buffer space (max 3840 bytes)
@@ -397,6 +460,8 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
                  USB_INTS_DEV_SUSPEND_BITS | USB_INTS_DEV_RESUME_FROM_HOST_BITS |
                  (FORCE_VBUS_DETECT ? 0 : USB_INTS_DEV_CONN_DIS_BITS);
 
+  add_repeating_timer_ms(10, rp2040_out_auto_zlp_timer_callback, NULL, &rp2040_out_auto_zlp_timer);
+
   dcd_connect(rhport);
   return true;
 }
@@ -410,6 +475,8 @@ bool dcd_deinit(uint8_t rhport) {
   // reset usb hardware into initial state
   reset_block(RESETS_RESET_USBCTRL_BITS);
   unreset_block_wait(RESETS_RESET_USBCTRL_BITS);
+
+  cancel_repeating_timer(&rp2040_out_auto_zlp_timer);
 
   return true;
 }
