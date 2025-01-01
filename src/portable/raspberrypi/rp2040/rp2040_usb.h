@@ -80,6 +80,9 @@ typedef struct hw_endpoint
     // Interrupt, bulk, etc
     uint8_t transfer_type;
 
+    // Last out transfer for auto zlp
+    uint32_t last_out_transfer;
+
     // Transfer scheduled but not active
     uint8_t pending;
 
